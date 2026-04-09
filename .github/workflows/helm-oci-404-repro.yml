@@ -1,0 +1,275 @@
+name: "Helm OCI Nested Path — Clean 404 Repro"
+
+# Focused reproduction of the 404 bug.
+# Scenario B explicitly wipes the repo before running so there
+# is no artifact at the root path — identical to the customer's environment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      jfrog_cli_version:
+        description: "JFrog CLI version to test (e.g. 2.99.0)"
+        required: false
+        default: "2.99.0"
+
+env:
+  CHART_NAME: "test-chart"
+  CHART_VERSION: "0.1.0"
+  OCI_REPO: "helm-oci-local"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Scenario A — Root path + build vars
+  # Pushes to oci://<host>/helm-oci-local (no subdirectory)
+  # Runs first so we have a known good baseline to compare against
+  # ──────────────────────────────────────────────────────────────
+  scenario-a-root-path:
+    name: "Scenario A — Root path (PASS baseline)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        with:
+          version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
+      - name: Package Helm chart
+        run: helm package test-chart --version ${{ env.CHART_VERSION }}
+
+      - name: Push to ROOT (no subdirectory) with build vars
+        env:
+          JFROG_BUILD_NAME: "helm-root-build"
+          JFROG_BUILD_NUMBER: "${{ github.run_number }}"
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "Target: oci://${OCI_HOST}/${{ env.OCI_REPO }}"
+          jf helm push \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
+            oci://${OCI_HOST}/${{ env.OCI_REPO }} \
+            --debug 2>&1 | tee scenario-a-output.txt
+
+      - name: Show AQL path used
+        if: always()
+        run: |
+          echo "=== AQL / property-setting lines from Scenario A ==="
+          grep -E "Setting properties on|AQL|items.find|404|error" scenario-a-output.txt || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-a-logs
+          path: scenario-a-output.txt
+
+  # ──────────────────────────────────────────────────────────────
+  # Scenario B — Nested path + build vars — CLEAN REPRO
+  # 1. Waits for Scenario A to complete
+  # 2. DELETES the artifact Scenario A uploaded (wipes root path)
+  # 3. Pushes to oci://<host>/helm-oci-local/subdir1/subdir2
+  # 4. CLI's wrong AQL targets the (now gone) root path → 404
+  #    This is identical to the customer's environment
+  # ──────────────────────────────────────────────────────────────
+  scenario-b-nested-path-clean:
+    name: "Scenario B — Nested path, clean repo (REPRODUCES 404)"
+    runs-on: ubuntu-latest
+    needs: scenario-a-root-path  # run after A so we have something to clean
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        with:
+          version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
+      - name: "CLEAN — Delete root artifact left by Scenario A"
+        run: |
+          echo "============================================================"
+          echo "Wiping helm-oci-local/test-chart/ from Artifactory..."
+          echo "This replicates the customer's clean environment where"
+          echo "no chart exists at the repo root — only in subdirectories."
+          echo "============================================================"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${{ secrets.JF_USER }}:${{ secrets.JF_PASSWORD }}" \
+            -X DELETE \
+            "${{ secrets.JF_URL }}/artifactory/${{ env.OCI_REPO }}/test-chart/")
+          echo "DELETE response: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" = "204" ] || [ "$HTTP_STATUS" = "200" ]; then
+            echo "Root artifact deleted successfully — repo is now clean."
+          else
+            echo "Warning: DELETE returned $HTTP_STATUS (may already be gone)"
+          fi
+          echo ""
+          echo "Verifying the path is gone:"
+          curl -s -o /dev/null -w "GET check -> %{http_code}\n" \
+            -u "${{ secrets.JF_USER }}:${{ secrets.JF_PASSWORD }}" \
+            "${{ secrets.JF_URL }}/artifactory/${{ env.OCI_REPO }}/test-chart/"
+
+      - name: Package Helm chart
+        run: helm package test-chart --version ${{ env.CHART_VERSION }}
+
+      - name: "Push to NESTED path with build vars — expect 404"
+        id: push_nested
+        env:
+          JFROG_BUILD_NAME: "helm-nested-build"
+          JFROG_BUILD_NUMBER: "${{ github.run_number }}"
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "============================================================"
+          echo "Target: oci://${OCI_HOST}/${{ env.OCI_REPO }}/subdir1/subdir2"
+          echo "JFROG_BUILD_NAME=$JFROG_BUILD_NAME"
+          echo "JFROG_BUILD_NUMBER=$JFROG_BUILD_NUMBER"
+          echo "============================================================"
+          jf helm push \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
+            oci://${OCI_HOST}/${{ env.OCI_REPO }}/subdir1/subdir2 \
+            --debug 2>&1 | tee scenario-b-output.txt
+          EXIT_CODE=$?
+          echo "push_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          exit $EXIT_CODE
+
+      - name: Show AQL path used and 404 evidence
+        if: always()
+        run: |
+          echo "=== AQL / property-setting lines from Scenario B ==="
+          grep -E "Setting properties on|AQL|items.find|404|server response|Error|error" \
+            scenario-b-output.txt || true
+          echo ""
+          echo "=== Comparing paths ==="
+          ACTUAL_PUSH=$(grep "Pushed:" scenario-b-output.txt | head -1 || echo "not found")
+          PROP_PATH=$(grep "Setting properties on:" scenario-b-output.txt | head -1 || echo "not found")
+          echo "Chart was pushed to : $ACTUAL_PUSH"
+          echo "Properties targeted : $PROP_PATH"
+          if echo "$PROP_PATH" | grep -q "subdir1"; then
+            echo "RESULT: Path is CORRECT (includes subdir1/subdir2)"
+          else
+            echo "RESULT: Path is WRONG (subdir1/subdir2 was stripped by CLI)"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-b-clean-logs
+          path: scenario-b-output.txt
+
+  # ──────────────────────────────────────────────────────────────
+  # Scenario C — Nested path, NO build vars, clean repo
+  # Confirms the push itself works — the bug is isolated to the
+  # build property association step
+  # ──────────────────────────────────────────────────────────────
+  scenario-c-no-build-vars:
+    name: "Scenario C — Nested path, no build vars (PASS — confirms push works)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        with:
+          version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
+      - name: Package Helm chart
+        run: helm package test-chart --version ${{ env.CHART_VERSION }}
+
+      - name: Push to nested path WITHOUT build vars
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "Target: oci://${OCI_HOST}/${{ env.OCI_REPO }}/subdir1/subdir2"
+          echo "No JFROG_BUILD_NAME / JFROG_BUILD_NUMBER set"
+          unset JFROG_BUILD_NAME
+          unset JFROG_BUILD_NUMBER
+          jf helm push \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
+            oci://${OCI_HOST}/${{ env.OCI_REPO }}/subdir1/subdir2 \
+            --debug 2>&1 | tee scenario-c-output.txt
+          echo "Exit code: $?"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-c-logs
+          path: scenario-c-output.txt
+
+  # ──────────────────────────────────────────────────────────────
+  # Summary
+  # ──────────────────────────────────────────────────────────────
+  summarize:
+    name: "Summary"
+    runs-on: ubuntu-latest
+    needs: [scenario-a-root-path, scenario-b-nested-path-clean, scenario-c-no-build-vars]
+    if: always()
+    steps:
+      - name: Download all logs
+        uses: actions/download-artifact@v4
+
+      - name: Print summary
+        run: |
+          echo "# Helm OCI Nested Path — Clean 404 Repro Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Description | Expected | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------------|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| A | Root path + build vars | PASS | ${{ needs.scenario-a-root-path.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| B | Nested path + build vars + clean repo | FAIL (404) | ${{ needs.scenario-b-nested-path-clean.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| C | Nested path, no build vars | PASS | ${{ needs.scenario-c-no-build-vars.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Scenario B — Path Comparison" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          PUSHED=$(grep "Pushed:" scenario-b-clean-logs/scenario-b-output.txt 2>/dev/null | head -1 || echo "N/A")
+          PROPS=$(grep "Setting properties on:" scenario-b-clean-logs/scenario-b-output.txt 2>/dev/null | head -1 || echo "N/A")
+          echo "Helm pushed chart to : $PUSHED" >> $GITHUB_STEP_SUMMARY
+          echo "CLI set properties on: $PROPS" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 404 Evidence" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "404|server response|Not Found" \
+            scenario-b-clean-logs/scenario-b-output.txt 2>/dev/null \
+            | grep -iv "helm\|OCI\|manifest\|blob" \
+            || echo "No 404 lines found — check full log artifact" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
