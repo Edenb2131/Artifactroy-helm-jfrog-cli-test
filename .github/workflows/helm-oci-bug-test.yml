@@ -11,14 +11,13 @@ on:
         default: "2.99.0"
 
 env:
-  HELM_REPO: "helm-local"
   CHART_NAME: "test-chart"
   CHART_VERSION: "0.1.0"
 
 jobs:
   # ──────────────────────────────────────────────
   # Scenario A: ROOT path (expected to WORK)
-  # oci://<host>/helm-local
+  # oci://<host>/helm-oci-local
   # ──────────────────────────────────────────────
   test-root-path:
     name: "Scenario A — Root path (should PASS)"
@@ -38,6 +37,13 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
       - name: Package Helm chart
         run: helm package test-chart --version ${{ env.CHART_VERSION }}
 
@@ -53,7 +59,7 @@ jobs:
           OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
           jf helm push \
             ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
-            oci://${OCI_HOST}/helm-local \
+            oci://${OCI_HOST}/helm-oci-local \
             --debug 2>&1 | tee scenario-a-output.txt
           echo "Exit code: $?"
 
@@ -65,8 +71,8 @@ jobs:
           path: scenario-a-output.txt
 
   # ──────────────────────────────────────────────
-  # Scenario B: NESTED path (expected to FAIL with 404)
-  # oci://<host>/helm-local/subdir1/subdir2
+  # Scenario B: NESTED path + build vars (expected to FAIL with 404)
+  # oci://<host>/helm-oci-local/subdir1/subdir2
   # ──────────────────────────────────────────────
   test-nested-path:
     name: "Scenario B — Nested path (REPRODUCES BUG)"
@@ -86,6 +92,13 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
       - name: Package Helm chart
         run: helm package test-chart --version ${{ env.CHART_VERSION }}
 
@@ -102,7 +115,7 @@ jobs:
           OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
           jf helm push \
             ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
-            oci://${OCI_HOST}/helm-local/subdir1/subdir2 \
+            oci://${OCI_HOST}/helm-oci-local/subdir1/subdir2 \
             --debug 2>&1 | tee scenario-b-output.txt
           EXIT_CODE=$?
           echo "Exit code: $EXIT_CODE"
@@ -141,6 +154,13 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
       - name: Package Helm chart
         run: helm package test-chart --version ${{ env.CHART_VERSION }}
 
@@ -155,7 +175,7 @@ jobs:
           unset JFROG_BUILD_NUMBER
           jf helm push \
             ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
-            oci://${OCI_HOST}/helm-local/subdir1/subdir2 \
+            oci://${OCI_HOST}/helm-oci-local/subdir1/subdir2 \
             --debug 2>&1 | tee scenario-c-output.txt
           echo "Exit code: $?"
 
@@ -205,5 +225,5 @@ jobs:
           echo '  items.find({"repo": "subdir1", "path": "test-chart/0.1.0"})' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "CORRECT (expected):" >> $GITHUB_STEP_SUMMARY
-          echo '  items.find({"repo": "helm-local", "path": "subdir1/subdir2/test-chart/0.1.0"})' >> $GITHUB_STEP_SUMMARY
+          echo '  items.find({"repo": "helm-oci-local", "path": "subdir1/subdir2/test-chart/0.1.0"})' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
