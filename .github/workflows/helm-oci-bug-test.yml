@@ -13,6 +13,7 @@ on:
 env:
   CHART_NAME: "test-chart"
   CHART_VERSION: "0.1.0"
+  JFROG_CLI_LOG_LEVEL: "DEBUG"
 
 jobs:
   # ──────────────────────────────────────────────
