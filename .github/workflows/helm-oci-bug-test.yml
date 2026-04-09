@@ -1,4 +1,4 @@
-name: "Case 409097 - Helm OCI Nested Path Bug Test"
+name: "Helm OCI Nested Path Bug Test"
 
 on:
   push:
@@ -11,14 +11,14 @@ on:
         default: "2.99.0"
 
 env:
-  HELM_REPO: "409097-helm-local"
+  HELM_REPO: "helm-local"
   CHART_NAME: "test-chart"
   CHART_VERSION: "0.1.0"
 
 jobs:
   # ──────────────────────────────────────────────
   # Scenario A: ROOT path (expected to WORK)
-  # oci://elinaf.jfrog.io/409097-helm-local
+  # oci://<host>/helm-local
   # ──────────────────────────────────────────────
   test-root-path:
     name: "Scenario A — Root path (should PASS)"
@@ -43,19 +43,17 @@ jobs:
 
       - name: "Push to ROOT of repo (no subdirectory)"
         env:
-          JFROG_BUILD_NAME: "409097-root-path-build"
+          JFROG_BUILD_NAME: "helm-root-path-build"
           JFROG_BUILD_NUMBER: "${{ github.run_number }}"
         run: |
           echo "============================================================"
           echo "Scenario A: Pushing to ROOT of OCI repo (no nested path)"
           echo "Expected: SUCCESS — CLI should correctly resolve repo name"
-          echo "OCI target: oci://${{ secrets.JF_URL | replace('https://', '') }}/409097-helm-local"
           echo "============================================================"
-          # Strip https:// for OCI URL
           OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
           jf helm push \
             ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
-            oci://${OCI_HOST}/409097-helm-local \
+            oci://${OCI_HOST}/helm-local \
             --debug 2>&1 | tee scenario-a-output.txt
           echo "Exit code: $?"
 
@@ -68,8 +66,7 @@ jobs:
 
   # ──────────────────────────────────────────────
   # Scenario B: NESTED path (expected to FAIL with 404)
-  # oci://elinaf.jfrog.io/409097-helm-local/subdir1/subdir2
-  # This replicates the customer bug
+  # oci://<host>/helm-local/subdir1/subdir2
   # ──────────────────────────────────────────────
   test-nested-path:
     name: "Scenario B — Nested path (REPRODUCES BUG)"
@@ -92,28 +89,26 @@ jobs:
       - name: Package Helm chart
         run: helm package test-chart --version ${{ env.CHART_VERSION }}
 
-      - name: "Push to NESTED path (replicates customer scenario)"
+      - name: "Push to NESTED path with build vars"
         env:
-          JFROG_BUILD_NAME: "409097-nested-path-build"
+          JFROG_BUILD_NAME: "helm-nested-path-build"
           JFROG_BUILD_NUMBER: "${{ github.run_number }}"
         run: |
           echo "============================================================"
           echo "Scenario B: Pushing to NESTED OCI path (subdirectories)"
           echo "Expected: FAIL — CLI incorrectly uses 'subdir1' as repo name"
           echo "           and truncates path in AQL query -> 404 on build props"
-          echo "OCI target: oci://elinaf.jfrog.io/409097-helm-local/subdir1/subdir2"
           echo "============================================================"
           OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
           jf helm push \
             ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
-            oci://${OCI_HOST}/409097-helm-local/subdir1/subdir2 \
+            oci://${OCI_HOST}/helm-local/subdir1/subdir2 \
             --debug 2>&1 | tee scenario-b-output.txt
-          # Capture exit code but don't fail the step — we want the logs
           EXIT_CODE=$?
           echo "Exit code: $EXIT_CODE"
           if grep -q "404" scenario-b-output.txt; then
             echo "BUG CONFIRMED: 404 error detected in nested path scenario"
-            echo "::error::Case 409097 BUG REPRODUCED — 404 on nested OCI path with build association"
+            echo "::error::BUG REPRODUCED — 404 on nested OCI path with build association"
           fi
           exit $EXIT_CODE
 
@@ -156,12 +151,11 @@ jobs:
           echo "Expected: SUCCESS — bug only triggers when build vars present"
           echo "============================================================"
           OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
-          # Explicitly unset build env vars to confirm they trigger the bug
           unset JFROG_BUILD_NAME
           unset JFROG_BUILD_NUMBER
           jf helm push \
             ${{ env.CHART_NAME }}-${{ env.CHART_VERSION }}.tgz \
-            oci://${OCI_HOST}/409097-helm-local/subdir1/subdir2 \
+            oci://${OCI_HOST}/helm-local/subdir1/subdir2 \
             --debug 2>&1 | tee scenario-c-output.txt
           echo "Exit code: $?"
 
@@ -176,7 +170,7 @@ jobs:
   # Summary job — collects results
   # ──────────────────────────────────────────────
   summarize:
-    name: "Bug Report Summary"
+    name: "Test Summary"
     runs-on: ubuntu-latest
     needs: [test-root-path, test-nested-path, test-nested-no-build]
     if: always()
@@ -186,9 +180,7 @@ jobs:
 
       - name: Print summary
         run: |
-          echo "# Case 409097 — Helm OCI Nested Path AQL Bug" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "# Helm OCI Nested Path AQL Bug — Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Scenario | Description | Expected | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------------|----------|--------|" >> $GITHUB_STEP_SUMMARY
@@ -196,17 +188,16 @@ jobs:
           echo "| B | Nested path + build vars | FAIL (404) | ${{ needs.test-nested-path.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| C | Nested path, no build vars | PASS | ${{ needs.test-nested-no-build.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Bug Details" >> $GITHUB_STEP_SUMMARY
+          echo "## Details" >> $GITHUB_STEP_SUMMARY
           echo "- **CLI Version:** ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Root cause:** JFrog CLI parses OCI URL by splitting on host, taking the first path segment as repo name." >> $GITHUB_STEP_SUMMARY
-          echo "- When URL is \`oci://host/REPO/subdir1/subdir2\`, CLI uses \`subdir1\` (wrong) instead of \`REPO\` as the Artifactory repo." >> $GITHUB_STEP_SUMMARY
+          echo "- When URL is \`oci://host/REPO/subdir1/subdir2\`, CLI uses \`subdir1\` (wrong) instead of \`REPO\`." >> $GITHUB_STEP_SUMMARY
           echo "- AQL path also truncates subdirectory components, producing the wrong artifact path." >> $GITHUB_STEP_SUMMARY
           echo "- The 404 occurs when CLI tries to assign build properties to the (non-existent) resolved path." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if grep -rl "404" scenario-b-nested-path-logs/ 2>/dev/null | grep -q .; then
             echo "**BUG STATUS: CONFIRMED — 404 error reproduced in Scenario B**" >> $GITHUB_STEP_SUMMARY
           fi
-
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## AQL Comparison" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -214,5 +205,5 @@ jobs:
           echo '  items.find({"repo": "subdir1", "path": "test-chart/0.1.0"})' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "CORRECT (expected):" >> $GITHUB_STEP_SUMMARY
-          echo '  items.find({"repo": "409097-helm-local", "path": "subdir1/subdir2/test-chart/0.1.0"})' >> $GITHUB_STEP_SUMMARY
+          echo '  items.find({"repo": "helm-local", "path": "subdir1/subdir2/test-chart/0.1.0"})' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
