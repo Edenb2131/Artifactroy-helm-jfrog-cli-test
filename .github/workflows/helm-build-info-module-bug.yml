@@ -1,0 +1,539 @@
+name: "Case 409097 - Helm Build-Info Module Bug (3 Scenarios)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      jfrog_cli_version:
+        description: "JFrog CLI version"
+        required: false
+        default: "2.99.0"
+
+env:
+  CHART_NAME: "test-chart"
+  DOCKER_IMAGE_NAME: "409097-test-app"
+  DOCKER_VERSION: "0.20.0"
+  CHART_VERSION_MATCH: "0.20.0"
+  CHART_VERSION_DIFF: "0.20.0-1"
+  HELM_REPO: "409097-helm-local"
+  DOCKER_REPO: "default-docker-local"
+  OCI_REPO: "helm-oci-local"
+  JFROG_CLI_LOG_LEVEL: "DEBUG"
+  BUILD_NAME: "409097-helm-module-bug"
+
+jobs:
+
+  # ── SETUP: Push a real Docker image once so all 3 scenarios can reference it ──
+  setup-docker-image:
+    name: "Setup — Push Docker image to Artifactory"
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        with:
+          version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}
+
+      - name: Login to Artifactory Docker registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | docker login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
+      - name: Pull, retag and push test image
+        id: push
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          IMAGE_TAG="${OCI_HOST}/${{ env.DOCKER_REPO }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_VERSION }}"
+
+          # Pull a tiny image and push it to Artifactory
+          docker pull alpine:3.19
+          docker tag alpine:3.19 "${IMAGE_TAG}"
+          docker push "${IMAGE_TAG}"
+
+          # Capture the digest
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_TAG}" 2>/dev/null \
+            || docker inspect --format='{{.Id}}' "${IMAGE_TAG}" | sed 's/sha256://')
+          # Get proper sha256 from registry
+          DIGEST=$(docker manifest inspect "${IMAGE_TAG}" 2>/dev/null | python3 -c "
+          import json,sys
+          m = json.load(sys.stdin)
+          print(m.get('config',{}).get('digest',''))
+          " 2>/dev/null || docker inspect --format='{{.Id}}' "${IMAGE_TAG}")
+
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+          echo "Image pushed: ${IMAGE_TAG}"
+          echo "Digest: ${DIGEST}"
+          echo "${IMAGE_TAG}@${DIGEST}" > image-file.txt
+          cat image-file.txt
+
+      - name: Upload image-file.txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-file
+          path: image-file.txt
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # SCENARIO F: Same version (chart=0.20.0 == Docker=0.20.0)
+  # Order: jf rt u → build-docker-create → helm push
+  # Expected: OCI merged INTO Docker module (Bug #1 — wrong module type)
+  # ──────────────────────────────────────────────────────────────────────────────
+  scenario-f-same-version:
+    name: "Scenario F — Same version (OCI merged into Docker module)"
+    runs-on: ubuntu-latest
+    needs: setup-docker-image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        with:
+          version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
+      - name: Download image-file.txt
+        uses: actions/download-artifact@v4
+        with:
+          name: image-file
+
+      - name: Package Helm chart (version 0.20.0 — matches Docker)
+        run: helm package test-chart --version ${{ env.CHART_VERSION_MATCH }}
+
+      - name: "SCENARIO F — rt u → build-docker-create → helm push (same version)"
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "F-${{ github.run_number }}"
+        run: |
+          echo "========================================================"
+          echo "Scenario F: chart version == Docker version (0.20.0)"
+          echo "Command order: rt u → build-docker-create → helm push"
+          echo "Expected: OCI artifacts merged into Docker module (Bug#1)"
+          echo "========================================================"
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+
+          echo "--- Step 1: Upload Helm legacy tgz ---"
+          jf rt u \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION_MATCH }}.tgz \
+            ${{ env.HELM_REPO }}/aplicaciones/409097-test/${{ env.CHART_NAME }}-${{ env.CHART_VERSION_MATCH }}.tgz \
+            2>&1 | tee -a scenario-f-log.txt
+
+          echo "--- Step 2: build-docker-create ---"
+          jf rt build-docker-create ${{ env.DOCKER_REPO }} --image-file=image-file.txt \
+            2>&1 | tee -a scenario-f-log.txt
+
+          echo "--- Step 3: helm push OCI ---"
+          jf helm push \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION_MATCH }}.tgz \
+            oci://${OCI_HOST}/${{ env.OCI_REPO }} \
+            2>&1 | tee -a scenario-f-log.txt
+
+      - name: Publish build
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "F-${{ github.run_number }}"
+        run: |
+          jf rt build-publish 2>&1 | tee scenario-f-publish.txt
+
+      - name: Inspect build-info and report
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "F-${{ github.run_number }}"
+        run: |
+          jf rt curl "/api/build/${{ env.BUILD_NAME }}/F-${{ github.run_number }}" \
+            > scenario-f-build-info.json 2>/dev/null
+
+          echo "=== Scenario F — Build-Info Module Summary ==="
+          python3 << 'PYEOF'
+          import json
+          d = json.load(open("scenario-f-build-info.json"))
+          bi = d.get("buildInfo", d)
+          modules = bi.get("modules", [])
+          print(f"Total modules: {len(modules)}")
+          for m in modules:
+              arts = m.get("artifacts", [])
+              repos = list(set(a.get("originalDeploymentRepo","?") for a in arts))
+              print(f"\n  Module id:   {m.get('id')}")
+              print(f"  Module type: {m.get('type')}")
+              print(f"  Artifacts:   {len(arts)}")
+              print(f"  Repos:       {repos}")
+              for a in arts:
+                  print(f"    - [{a.get('originalDeploymentRepo','?')}] {a.get('name')}")
+          PYEOF
+
+          echo ""
+          echo "=== OCI Repo artifacts in this build? ==="
+          python3 -c "
+          import json
+          d = json.load(open('scenario-f-build-info.json'))
+          bi = d.get('buildInfo', d)
+          all_arts = [a for m in bi.get('modules',[]) for a in m.get('artifacts',[])]
+          oci_arts = [a for a in all_arts if a.get('originalDeploymentRepo','') == '${{ env.OCI_REPO }}']
+          print(f'OCI repo artifacts in build: {len(oci_arts)}')
+          for a in oci_arts:
+              m_info = next((m for m in bi.get('modules',[]) if a in m.get('artifacts',[])), {})
+              print(f'  [{m_info.get(\"type\",\"?\")} module: {m_info.get(\"id\",\"?\")}] {a.get(\"name\")}')
+          "
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scenario F — Same Version (0.20.0 == 0.20.0)" >> $GITHUB_STEP_SUMMARY
+          echo "**Order:** rt u → build-docker-create → helm push" >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYEOF' >> $GITHUB_STEP_SUMMARY
+          import json
+          d = json.load(open("scenario-f-build-info.json"))
+          bi = d.get("buildInfo", d)
+          modules = bi.get("modules", [])
+          print(f"\n**Modules in build-info:** {len(modules)}\n")
+          print("| Module ID | Type | Artifact Count | Repos |")
+          print("|-----------|------|---------------|-------|")
+          for m in modules:
+              arts = m.get("artifacts", [])
+              repos = ", ".join(set(a.get("originalDeploymentRepo","?") for a in arts))
+              print(f"| {m.get('id')} | {m.get('type')} | {len(arts)} | {repos} |")
+          all_arts = [a for m in modules for a in m.get("artifacts",[])]
+          oci_arts = [a for a in all_arts if a.get("originalDeploymentRepo","") == "helm-oci-local"]
+          oci_m = next((m for m in modules if any(a in m.get("artifacts",[]) for a in oci_arts)), None)
+          if oci_arts:
+              print(f"\n**OCI artifacts found:** {len(oci_arts)} — in module `{oci_m.get('id') if oci_m else '?'}` (type: `{oci_m.get('type') if oci_m else '?'}`)")
+          else:
+              print("\n**OCI artifacts found:** 0 — OCI artifact MISSING from build-info")
+          PYEOF
+
+      - name: Upload Scenario F artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-f-same-version
+          path: |
+            scenario-f-log.txt
+            scenario-f-publish.txt
+            scenario-f-build-info.json
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # SCENARIO G: Different versions (chart=0.20.0-1, Docker=0.20.0)
+  # Order: jf rt u → build-docker-create → helm push
+  # Expected: OCI completely missing from build-info (Bug #2)
+  # ──────────────────────────────────────────────────────────────────────────────
+  scenario-g-diff-version:
+    name: "Scenario G — Different version, same order (OCI missing)"
+    runs-on: ubuntu-latest
+    needs: setup-docker-image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        with:
+          version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
+      - name: Download image-file.txt
+        uses: actions/download-artifact@v4
+        with:
+          name: image-file
+
+      - name: Package Helm chart (version 0.20.0-1 — different from Docker 0.20.0)
+        run: helm package test-chart --version ${{ env.CHART_VERSION_DIFF }}
+
+      - name: "SCENARIO G — rt u → build-docker-create → helm push (different version)"
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "G-${{ github.run_number }}"
+        run: |
+          echo "========================================================"
+          echo "Scenario G: chart version != Docker version"
+          echo "  Chart: 0.20.0-1   Docker: 0.20.0"
+          echo "Command order: rt u → build-docker-create → helm push"
+          echo "Expected: OCI artifact MISSING from build-info (Bug #2)"
+          echo "========================================================"
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+
+          echo "--- Step 1: Upload Helm legacy tgz (0.20.0-1) ---"
+          jf rt u \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION_DIFF }}.tgz \
+            ${{ env.HELM_REPO }}/aplicaciones/409097-test/${{ env.CHART_NAME }}-${{ env.CHART_VERSION_DIFF }}.tgz \
+            2>&1 | tee -a scenario-g-log.txt
+
+          echo "--- Step 2: build-docker-create (Docker 0.20.0) ---"
+          jf rt build-docker-create ${{ env.DOCKER_REPO }} --image-file=image-file.txt \
+            2>&1 | tee -a scenario-g-log.txt
+
+          echo "--- Step 3: helm push OCI (chart 0.20.0-1) ---"
+          jf helm push \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION_DIFF }}.tgz \
+            oci://${OCI_HOST}/${{ env.OCI_REPO }} \
+            2>&1 | tee -a scenario-g-log.txt
+
+          echo ""
+          echo "=== AQL queries from helm push ==="
+          grep -i "items.find\|Found OCI\|Searching Artifactory\|Creating temp build\|Build info saved" scenario-g-log.txt || true
+
+      - name: Publish build
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "G-${{ github.run_number }}"
+        run: |
+          jf rt build-publish 2>&1 | tee scenario-g-publish.txt
+
+      - name: Inspect build-info and report
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "G-${{ github.run_number }}"
+        run: |
+          jf rt curl "/api/build/${{ env.BUILD_NAME }}/G-${{ github.run_number }}" \
+            > scenario-g-build-info.json 2>/dev/null
+
+          echo "=== Scenario G — Build-Info Module Summary ==="
+          python3 << 'PYEOF'
+          import json
+          d = json.load(open("scenario-g-build-info.json"))
+          bi = d.get("buildInfo", d)
+          modules = bi.get("modules", [])
+          print(f"Total modules: {len(modules)}")
+          for m in modules:
+              arts = m.get("artifacts", [])
+              repos = list(set(a.get("originalDeploymentRepo","?") for a in arts))
+              print(f"\n  Module id:   {m.get('id')}")
+              print(f"  Module type: {m.get('type')}")
+              print(f"  Artifacts:   {len(arts)}")
+              print(f"  Repos:       {repos}")
+          all_arts = [a for m in modules for a in m.get("artifacts",[])]
+          oci_arts = [a for a in all_arts if a.get("originalDeploymentRepo","") == "helm-oci-local"]
+          print(f"\nOCI repo artifacts in build: {len(oci_arts)}")
+          if not oci_arts:
+              print("BUG CONFIRMED: OCI artifact is MISSING from build-info")
+          PYEOF
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scenario G — Different Version (chart=0.20.0-1, Docker=0.20.0)" >> $GITHUB_STEP_SUMMARY
+          echo "**Order:** rt u → build-docker-create → helm push" >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYEOF' >> $GITHUB_STEP_SUMMARY
+          import json
+          d = json.load(open("scenario-g-build-info.json"))
+          bi = d.get("buildInfo", d)
+          modules = bi.get("modules", [])
+          print(f"\n**Modules in build-info:** {len(modules)}\n")
+          print("| Module ID | Type | Artifact Count | Repos |")
+          print("|-----------|------|---------------|-------|")
+          for m in modules:
+              arts = m.get("artifacts", [])
+              repos = ", ".join(set(a.get("originalDeploymentRepo","?") for a in arts))
+              print(f"| {m.get('id')} | {m.get('type')} | {len(arts)} | {repos} |")
+          all_arts = [a for m in modules for a in m.get("artifacts",[])]
+          oci_arts = [a for a in all_arts if a.get("originalDeploymentRepo","") == "helm-oci-local"]
+          if oci_arts:
+              oci_m = next((m for m in modules if any(a in m.get("artifacts",[]) for a in oci_arts)), None)
+              print(f"\n**OCI artifacts found:** {len(oci_arts)} — in module `{oci_m.get('id') if oci_m else '?'}` (type: `{oci_m.get('type') if oci_m else '?'}`)")
+          else:
+              print("\n**OCI artifacts found:** 0 — ⚠️ OCI artifact MISSING from build-info (Bug #2 reproduced)")
+          PYEOF
+
+      - name: Upload Scenario G artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-g-diff-version
+          path: |
+            scenario-g-log.txt
+            scenario-g-publish.txt
+            scenario-g-build-info.json
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # SCENARIO H: Different versions (chart=0.20.0-1, Docker=0.20.0)
+  # Order: helm push FIRST → jf rt u → build-docker-create
+  # Expected: CORRECT — separate helm module (workaround)
+  # ──────────────────────────────────────────────────────────────────────────────
+  scenario-h-reordered:
+    name: "Scenario H — Different version, helm push FIRST (correct result)"
+    runs-on: ubuntu-latest
+    needs: setup-docker-image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        with:
+          version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to Helm OCI registry
+        run: |
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+          echo "${{ secrets.JF_PASSWORD }}" | helm registry login "${OCI_HOST}" \
+            --username "${{ secrets.JF_USER }}" \
+            --password-stdin
+
+      - name: Download image-file.txt
+        uses: actions/download-artifact@v4
+        with:
+          name: image-file
+
+      - name: Package Helm chart (version 0.20.0-1)
+        run: helm package test-chart --version ${{ env.CHART_VERSION_DIFF }}
+
+      - name: "SCENARIO H — helm push FIRST → rt u → build-docker-create (workaround)"
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "H-${{ github.run_number }}"
+        run: |
+          echo "========================================================"
+          echo "Scenario H: chart version != Docker version (REORDERED)"
+          echo "  Chart: 0.20.0-1   Docker: 0.20.0"
+          echo "Command order: helm push → rt u → build-docker-create"
+          echo "Expected: Separate 'helm' module — CORRECT result"
+          echo "========================================================"
+          OCI_HOST=$(echo "${{ secrets.JF_URL }}" | sed 's|https://||')
+
+          echo "--- Step 1: helm push OCI FIRST (chart 0.20.0-1) ---"
+          jf helm push \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION_DIFF }}.tgz \
+            oci://${OCI_HOST}/${{ env.OCI_REPO }} \
+            2>&1 | tee -a scenario-h-log.txt
+
+          echo "--- Step 2: Upload Helm legacy tgz (0.20.0-1) ---"
+          jf rt u \
+            ${{ env.CHART_NAME }}-${{ env.CHART_VERSION_DIFF }}.tgz \
+            ${{ env.HELM_REPO }}/aplicaciones/409097-test/${{ env.CHART_NAME }}-${{ env.CHART_VERSION_DIFF }}.tgz \
+            2>&1 | tee -a scenario-h-log.txt
+
+          echo "--- Step 3: build-docker-create (Docker 0.20.0) ---"
+          jf rt build-docker-create ${{ env.DOCKER_REPO }} --image-file=image-file.txt \
+            2>&1 | tee -a scenario-h-log.txt
+
+      - name: Publish build
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "H-${{ github.run_number }}"
+        run: |
+          jf rt build-publish 2>&1 | tee scenario-h-publish.txt
+
+      - name: Inspect build-info and report
+        env:
+          JFROG_CLI_BUILD_NAME: "${{ env.BUILD_NAME }}"
+          JFROG_CLI_BUILD_NUMBER: "H-${{ github.run_number }}"
+        run: |
+          jf rt curl "/api/build/${{ env.BUILD_NAME }}/H-${{ github.run_number }}" \
+            > scenario-h-build-info.json 2>/dev/null
+
+          echo "=== Scenario H — Build-Info Module Summary ==="
+          python3 << 'PYEOF'
+          import json
+          d = json.load(open("scenario-h-build-info.json"))
+          bi = d.get("buildInfo", d)
+          modules = bi.get("modules", [])
+          print(f"Total modules: {len(modules)}")
+          for m in modules:
+              arts = m.get("artifacts", [])
+              repos = list(set(a.get("originalDeploymentRepo","?") for a in arts))
+              print(f"\n  Module id:   {m.get('id')}")
+              print(f"  Module type: {m.get('type')}")
+              print(f"  Artifacts:   {len(arts)}")
+              print(f"  Repos:       {repos}")
+          all_arts = [a for m in modules for a in m.get("artifacts",[])]
+          oci_arts = [a for a in all_arts if a.get("originalDeploymentRepo","") == "helm-oci-local"]
+          oci_m = next((m for m in modules if any(a in m.get("artifacts",[]) for a in oci_arts)), None)
+          print(f"\nOCI repo artifacts in build: {len(oci_arts)}")
+          if oci_arts and oci_m:
+              if oci_m.get("type") == "helm":
+                  print(f"PASS: OCI present as separate 'helm' module ({oci_m.get('id')})")
+              else:
+                  print(f"PARTIAL: OCI present but in '{oci_m.get('type')}' module, not 'helm'")
+          else:
+              print("FAIL: OCI artifact missing")
+          PYEOF
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scenario H — Different Version, Reordered (helm push FIRST)" >> $GITHUB_STEP_SUMMARY
+          echo "**Order:** helm push → rt u → build-docker-create" >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYEOF' >> $GITHUB_STEP_SUMMARY
+          import json
+          d = json.load(open("scenario-h-build-info.json"))
+          bi = d.get("buildInfo", d)
+          modules = bi.get("modules", [])
+          print(f"\n**Modules in build-info:** {len(modules)}\n")
+          print("| Module ID | Type | Artifact Count | Repos |")
+          print("|-----------|------|---------------|-------|")
+          for m in modules:
+              arts = m.get("artifacts", [])
+              repos = ", ".join(set(a.get("originalDeploymentRepo","?") for a in arts))
+              print(f"| {m.get('id')} | {m.get('type')} | {len(arts)} | {repos} |")
+          all_arts = [a for m in modules for a in m.get("artifacts",[])]
+          oci_arts = [a for a in all_arts if a.get("originalDeploymentRepo","") == "helm-oci-local"]
+          oci_m = next((m for m in modules if any(a in m.get("artifacts",[]) for a in oci_arts)), None)
+          if oci_arts and oci_m:
+              mtype = oci_m.get("type","?")
+              status = "✅ PASS — OCI has own `helm` module" if mtype == "helm" else f"⚠️ OCI present but in `{mtype}` module"
+              print(f"\n**OCI artifacts found:** {len(oci_arts)} — {status}")
+          else:
+              print("\n**OCI artifacts found:** 0 — ❌ OCI MISSING")
+          PYEOF
+
+      - name: Upload Scenario H artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-h-reordered
+          path: |
+            scenario-h-log.txt
+            scenario-h-publish.txt
+            scenario-h-build-info.json
+
+  # ── FINAL SUMMARY ──
+  summarize:
+    name: "Final Summary"
+    runs-on: ubuntu-latest
+    needs: [scenario-f-same-version, scenario-g-diff-version, scenario-h-reordered]
+    if: always()
+    steps:
+      - name: Print summary table
+        run: |
+          echo "# Case 409097 — Helm Build-Info Module Bug Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scenario | Chart Ver | Docker Ver | Order | Expected | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-----------|------------|-------|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| F | 0.20.0 | 0.20.0 | rt-u → docker-create → helm-push | OCI merged into Docker module (Bug#1) | ${{ needs.scenario-f-same-version.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| G | 0.20.0-1 | 0.20.0 | rt-u → docker-create → helm-push | OCI MISSING from build-info (Bug#2) | ${{ needs.scenario-g-diff-version.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| H | 0.20.0-1 | 0.20.0 | **helm-push FIRST** → rt-u → docker-create | OCI in own \`helm\` module (workaround) | ${{ needs.scenario-h-reordered.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## CLI Version: ${{ github.event.inputs.jfrog_cli_version || '2.99.0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Key Question for R&D" >> $GITHUB_STEP_SUMMARY
+          echo "Is it by design that \`jf helm push\` merges OCI artifacts into an existing Docker module when versions match? And is the silent drop (Scenario G) a known limitation?" >> $GITHUB_STEP_SUMMARY
