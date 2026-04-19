@@ -73,23 +73,29 @@ jobs:
 
           docker pull alpine:3.19
           docker tag alpine:3.19 "${IMAGE}"
-          docker push "${IMAGE}"
 
-          # Get the config digest (used as the image ID in build-info, matching
-          # how build-docker-create identifies the module)
-          CONFIG_DIGEST=$(docker inspect --format='{{.Id}}' "${IMAGE}")
-          REPO_DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{.}}{{end}}' "${IMAGE}" | head -1)
+          # Capture manifest digest from push output
+          # docker push outputs: "<tag>: digest: sha256:<hash> size: <n>"
+          PUSH_OUT=$(docker push "${IMAGE}" 2>&1)
+          echo "${PUSH_OUT}"
+          MANIFEST_DIGEST=$(echo "${PUSH_OUT}" | grep -oP 'sha256:[a-f0-9]{64}' | tail -1)
 
-          echo "IMAGE=${IMAGE}" >> $GITHUB_ENV
-          echo "CONFIG_DIGEST=${CONFIG_DIGEST}" >> $GITHUB_ENV
-
-          # image-file.txt format: <full-image-ref>@<repo-digest>
-          # Matches customer's: artifactory.../producto-docker-dev/.../<name>:<tag>@sha256:<digest>
-          if [ -n "${REPO_DIGEST}" ]; then
-            echo "${REPO_DIGEST}" > image-file.txt
-          else
-            echo "${IMAGE}@${CONFIG_DIGEST}" > image-file.txt
+          if [ -z "${MANIFEST_DIGEST}" ]; then
+            # Fallback: fetch manifest digest via Artifactory Docker v2 API
+            MANIFEST_DIGEST=$(curl -s -I \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              -u "${{ secrets.JF_USER }}:${{ secrets.JF_PASSWORD }}" \
+              "${{ secrets.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_REPO }}/v2/${{ env.APP_NAME }}/manifests/${{ env.DOCKER_VERSION }}" \
+              | grep -i 'docker-content-digest' | awk '{print $2}' | tr -d '\r')
           fi
+
+          echo "Manifest digest: ${MANIFEST_DIGEST}"
+
+          # image-file.txt format required by build-docker-create:
+          #   <registry>/<repo>/<image>:<tag>@sha256:<manifest-digest>
+          # This matches the customer's format:
+          #   artifactory.itg.gcp.mercadona.com/producto-docker-dev/.../demoscicd-front-demoscicdocp:0.20.0@sha256:<digest>
+          echo "${IMAGE}@${MANIFEST_DIGEST}" > image-file.txt
 
           echo "image-file.txt contents:"
           cat image-file.txt
